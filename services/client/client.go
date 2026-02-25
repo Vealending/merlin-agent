@@ -99,6 +99,21 @@ func (s *Service) Reset() (err error) {
 	return
 }
 
+// filePuller is an optional interface for clients that support pulling files chunk-by-chunk from the server
+type filePuller interface {
+	PullFile(taskID, fileID string, chunkSize int) ([]byte, error)
+}
+
+// PullFile requests a file from the server chunk-by-chunk and returns the assembled raw bytes.
+// Only supported by clients that implement the filePuller interface (e.g., Mythic).
+func (s *Service) PullFile(taskID, fileID string, chunkSize int) ([]byte, error) {
+	c := s.ClientRepo.Get()
+	if fp, ok := c.(filePuller); ok {
+		return fp.PullFile(taskID, fileID, chunkSize)
+	}
+	return nil, fmt.Errorf("services/client.PullFile(): current client does not support chunked file pull")
+}
+
 // Send takes in a Base message and uses the Agent's Client to send it to the Merlin server or parent Agent
 func (s *Service) Send(msg messages.Base) ([]messages.Base, error) {
 	return s.ClientRepo.Get().Send(msg)

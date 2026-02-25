@@ -30,3 +30,10 @@ func WSLCommand(cmd jobs.Command) jobs.Results {
 		Stderr: "the wsl command is only supported on Windows",
 	}
 }
+
+// WSLImportPipe is a stub for non-Windows platforms
+func WSLImportPipe(name string, data []byte, targetDir string) jobs.Results {
+	return jobs.Results{
+		Stderr: "the wsl command is only supported on Windows",
+	}
+}

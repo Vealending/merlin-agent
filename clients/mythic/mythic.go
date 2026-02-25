@@ -440,6 +440,7 @@ func (client *Client) Send(m messages.Base) (returnMessages []messages.Base, err
 		err = fmt.Errorf("there was an error sending a message to the server:\n%s", err)
 		return
 	}
+	defer resp.Body.Close()
 	cli.Message(cli.DEBUG, fmt.Sprintf("HTTP Response:\n%+v", resp))
 	// Process the response
 
@@ -464,6 +465,95 @@ func (client *Client) Send(m messages.Base) (returnMessages []messages.Base, err
 		return
 	}
 	return client.Deconstruct(respData)
+}
+
+// PullFile requests a file from the Mythic server chunk-by-chunk using the upload protocol and returns the assembled bytes
+func (client *Client) PullFile(taskID, fileID string, chunkSize int) ([]byte, error) {
+	cli.Message(cli.DEBUG, fmt.Sprintf("clients/mythic.PullFile(): taskID=%s fileID=%s chunkSize=%d", taskID, fileID, chunkSize))
+
+	tid, err := uuid.Parse(taskID)
+	if err != nil {
+		return nil, fmt.Errorf("PullFile: invalid task ID %q: %w", taskID, err)
+	}
+
+	var buf bytes.Buffer
+	totalChunks := 0
+	for chunkNum := 1; ; chunkNum++ {
+		req := messages.Base{
+			ID:   client.AgentID,
+			Type: UploadChunkReq,
+			Payload: ClientTaskResponse{
+				ID: tid,
+				Upload: &UploadChunkRequest{
+					ChunkSize: chunkSize,
+					ChunkNum:  chunkNum,
+					FileID:    fileID,
+					FullPath:  "",
+				},
+			},
+		}
+
+		resp, err := client.Send(req)
+		if err != nil {
+			return nil, fmt.Errorf("PullFile chunk %d: Send failed: %w", chunkNum, err)
+		}
+
+		// Extract UploadChunkResponse from response
+		var ucr UploadChunkResponse
+		found := false
+		for _, msg := range resp {
+			if msg.Type != messages.JOBS {
+				continue
+			}
+			js, ok := msg.Payload.([]jobs.Job)
+			if !ok {
+				continue
+			}
+			for _, j := range js {
+				if j.Type != UploadChunkReq {
+					continue
+				}
+				r, ok := j.Payload.(UploadChunkResponse)
+				if !ok {
+					continue
+				}
+				if r.FileID != fileID {
+					continue
+				}
+				ucr = r
+				found = true
+				break
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("PullFile chunk %d: no UploadChunkResponse for file %s in server reply", chunkNum, fileID)
+		}
+		if ucr.ChunkNum != chunkNum {
+			return nil, fmt.Errorf("PullFile: expected chunk %d but got %d", chunkNum, ucr.ChunkNum)
+		}
+
+		// Decode chunk data
+		decoded, err := base64.StdEncoding.DecodeString(ucr.ChunkData)
+		if err != nil {
+			return nil, fmt.Errorf("PullFile chunk %d: base64 decode failed: %w", chunkNum, err)
+		}
+		buf.Write(decoded)
+
+		if totalChunks == 0 {
+			totalChunks = ucr.TotalChunks
+		}
+		cli.Message(cli.NOTE, fmt.Sprintf("PullFile: received chunk %d/%d (%d bytes)", chunkNum, totalChunks, len(decoded)))
+
+		if chunkNum >= totalChunks {
+			break
+		}
+	}
+
+	cli.Message(cli.NOTE, fmt.Sprintf("PullFile: complete, %d bytes assembled", buf.Len()))
+	return buf.Bytes(), nil
 }
 
 // Initial executes the specific steps required to establish a connection with the C2 server and checkin or register an agent
@@ -779,6 +869,16 @@ func (client *Client) Deconstruct(data []byte) (returnMessages []messages.Base, 
 			}
 		}
 		return
+	case UPLOAD:
+		var msg UploadChunkResponse
+		err = json.Unmarshal(data, &msg)
+		if err != nil {
+			err = fmt.Errorf("there was an error unmarshalling the JSON object to mythic.UploadChunkResponse in the message handler:\n%s", err)
+			return
+		}
+		returnMessage.Type = messages.JOBS
+		returnMessage.Payload = []jobs.Job{{Type: UploadChunkReq, Payload: msg}}
+		returnMessages = append(returnMessages, returnMessage)
 	default:
 		err = fmt.Errorf("unknown Mythic action: %s", action)
 		return
@@ -997,6 +1097,13 @@ func (client *Client) Construct(m messages.Base) ([]byte, error) {
 		data, err = json.Marshal(returnMessage)
 		if err != nil {
 			return []byte{}, fmt.Errorf("there was an error marshalling the mythic.FileDownload structure to JSON: %s", err)
+		}
+	case UploadChunkReq:
+		returnMessage := PostResponse{Action: RESPONSE, Padding: m.Padding}
+		returnMessage.Responses = append(returnMessage.Responses, m.Payload.(ClientTaskResponse))
+		data, err = json.Marshal(returnMessage)
+		if err != nil {
+			return []byte{}, fmt.Errorf("there was an error marshalling the mythic.UploadChunkRequest structure to JSON: %s", err)
 		}
 	default:
 		return []byte{}, fmt.Errorf("unhandled message type: %d for convertToMythicMessage()", m.Type)

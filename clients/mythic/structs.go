@@ -46,6 +46,8 @@ const (
 	DownloadInit = 300
 	// DownloadSend is used after the init message to send the file
 	DownloadSend = 301
+	// UploadChunkReq is used to request a file chunk from the Mythic server via the upload protocol
+	UploadChunkReq = 400
 )
 
 // CheckIn is the initial structure sent to Mythic
@@ -119,11 +121,12 @@ type PostResponse struct {
 // ClientTaskResponse is the structure used to return the results of a task to the Mythic server
 // https://docs.mythic-c2.net/customizing/c2-related-development/c2-profile-code/agent-side-coding/action-post_response
 type ClientTaskResponse struct {
-	ID        uuid.UUID     `json:"task_id"`
-	Download  *FileDownload `json:"download,omitempty"`
-	Output    string        `json:"user_output,omitempty"`
-	Status    string        `json:"status,omitempty"`
-	Completed bool          `json:"completed,omitempty"`
+	ID        uuid.UUID           `json:"task_id"`
+	Download  *FileDownload       `json:"download,omitempty"`
+	Upload    *UploadChunkRequest `json:"upload,omitempty"`
+	Output    string              `json:"user_output,omitempty"`
+	Status    string              `json:"status,omitempty"`
+	Completed bool                `json:"completed,omitempty"`
 }
 
 // ServerTaskResponse is the message Mythic returns to the client after it sent a ClientTaskResponse message
@@ -196,6 +199,23 @@ type UploadRequest struct {
 type UploadResponse struct {
 	Path   string `json:"remote_path"`
 	FileID string `json:"file_id"`
+}
+
+// UploadChunkRequest is sent by the agent to request a specific chunk of a file from the Mythic server
+type UploadChunkRequest struct {
+	ChunkSize int    `json:"chunk_size"`
+	ChunkNum  int    `json:"chunk_num"`
+	FileID    string `json:"file_id"`
+	FullPath  string `json:"full_path"`
+}
+
+// UploadChunkResponse is the server's response containing a chunk of file data
+type UploadChunkResponse struct {
+	Action      string `json:"action"`
+	ChunkNum    int    `json:"chunk_num"`
+	ChunkData   string `json:"chunk_data"`
+	FileID      string `json:"file_id"`
+	TotalChunks int    `json:"total_chunks"`
 }
 
 // Socks is used to send SOCKS data between the SOCKS client and the agent and is an array on the

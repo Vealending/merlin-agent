@@ -25,6 +25,8 @@ package commands
 import (
 	"encoding/base64"
 	"fmt"
+	"io"
+	"net/http"
 	"runtime"
 	"strings"
 	"syscall"
@@ -440,9 +442,7 @@ func importDistributionPipe(name string, data []byte, targetDir string) (stdout,
 	windows.CloseHandle(readPipe)
 
 	// Wait for the writer goroutine to finish
-	if writeErr := <-errCh; writeErr != nil {
-		cli.Message(cli.WARN, fmt.Sprintf("pipe writer: %s", writeErr))
-	}
+	writeErr := <-errCh
 
 	if installedName != 0 {
 		procCoTaskMemFree.Call(installedName)
@@ -455,12 +455,153 @@ func importDistributionPipe(name string, data []byte, targetDir string) (stdout,
 			errMsg += fmt.Sprintf("\nError detail: %s", errStr)
 		}
 		freeErrorInfo(&errorInfo)
+		if writeErr != nil {
+			errMsg += fmt.Sprintf("\nPipe writer: %s", writeErr)
+		}
 		stderr = errMsg
 		return
 	}
 	freeErrorInfo(&errorInfo)
 
+	if writeErr != nil {
+		stderr = fmt.Sprintf("pipe writer failed: %s", writeErr)
+		return
+	}
+
 	stdout = fmt.Sprintf("Successfully imported distribution '%s'\nGUID: {%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+		name,
+		distroGUID.Data1, distroGUID.Data2, distroGUID.Data3,
+		distroGUID.Data4[0], distroGUID.Data4[1], distroGUID.Data4[2],
+		distroGUID.Data4[3], distroGUID.Data4[4], distroGUID.Data4[5],
+		distroGUID.Data4[6], distroGUID.Data4[7])
+	return
+}
+
+// importDistributionURL imports a WSL distribution by streaming a tarball from an HTTP(S)
+// URL through an anonymous pipe to RegisterDistributionPipe (Proc5). No file touches disk.
+func importDistributionURL(name, url, targetDir string) (stdout, stderr string) {
+	cs, cleanup, err := newCOMSession()
+	if err != nil {
+		stderr = err.Error()
+		return
+	}
+	defer cleanup()
+
+	nameWide, err := syscall.UTF16PtrFromString(name)
+	if err != nil {
+		stderr = fmt.Sprintf("failed to convert distro name: %s", err)
+		return
+	}
+
+	var targetDirPtr uintptr
+	if targetDir != "" {
+		td, err := syscall.UTF16PtrFromString(targetDir)
+		if err != nil {
+			stderr = fmt.Sprintf("failed to convert target directory: %s", err)
+			return
+		}
+		targetDirPtr = uintptr(unsafe.Pointer(td))
+	}
+
+	// Create anonymous pipe for streaming the tarball to the WSL service
+	var readPipe, writePipe windows.Handle
+	sa := &windows.SecurityAttributes{InheritHandle: 1}
+	if err := windows.CreatePipe(&readPipe, &writePipe, sa, 0); err != nil {
+		stderr = fmt.Sprintf("CreatePipe failed: %s", err)
+		return
+	}
+
+	// Fetch URL and stream response body to pipe write end in a background goroutine
+	errCh := make(chan error, 1)
+	go func() {
+		defer windows.CloseHandle(writePipe)
+		httpClient := &http.Client{Timeout: 30 * time.Minute}
+		resp, err := httpClient.Get(url)
+		if err != nil {
+			errCh <- fmt.Errorf("HTTP GET failed: %w", err)
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			errCh <- fmt.Errorf("HTTP GET returned status %d", resp.StatusCode)
+			return
+		}
+		// Stream response body to pipe using a buffer
+		buf := make([]byte, 65536)
+		for {
+			n, readErr := resp.Body.Read(buf)
+			if n > 0 {
+				offset := 0
+				for offset < n {
+					var written uint32
+					chunk := buf[offset:n]
+					if writeErr := windows.WriteFile(writePipe, chunk, &written, nil); writeErr != nil {
+						errCh <- fmt.Errorf("pipe write failed: %w", writeErr)
+						return
+					}
+					offset += int(written)
+				}
+			}
+			if readErr == io.EOF {
+				break
+			}
+			if readErr != nil {
+				errCh <- fmt.Errorf("HTTP body read failed: %w", readErr)
+				return
+			}
+		}
+		errCh <- nil
+	}()
+
+	var errorInfo lxssErrorInfo
+	var distroGUID windows.GUID
+	var installedName uintptr
+
+	cli.Message(cli.NOTE, fmt.Sprintf("Importing distribution '%s' from URL '%s' via pipe...", name, url))
+
+	args := buildRegisterArgs(cs.ifVer,
+		uintptr(unsafe.Pointer(nameWide)),
+		uintptr(readPipe),
+		0, // stderrPipe — not used for simplicity
+		targetDirPtr,
+		&installedName,
+		&errorInfo,
+		&distroGUID,
+	)
+
+	_, comErr := comVtableCall(cs.session, vtableRegisterDistPipe, args...)
+
+	// Close the read end now that the COM call completed
+	windows.CloseHandle(readPipe)
+
+	// Wait for the writer goroutine to finish
+	writeErr := <-errCh
+
+	if installedName != 0 {
+		procCoTaskMemFree.Call(installedName)
+	}
+
+	if comErr != nil {
+		errMsg := fmt.Sprintf("RegisterDistributionPipe failed: %s", comErr)
+		if errorInfo.Member10 != 0 {
+			errStr := windows.UTF16PtrToString((*uint16)(unsafe.Pointer(errorInfo.Member10)))
+			errMsg += fmt.Sprintf("\nError detail: %s", errStr)
+		}
+		freeErrorInfo(&errorInfo)
+		if writeErr != nil {
+			errMsg += fmt.Sprintf("\nURL streamer: %s", writeErr)
+		}
+		stderr = errMsg
+		return
+	}
+	freeErrorInfo(&errorInfo)
+
+	if writeErr != nil {
+		stderr = fmt.Sprintf("URL streamer failed: %s", writeErr)
+		return
+	}
+
+	stdout = fmt.Sprintf("Successfully imported distribution '%s' from URL\nGUID: {%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
 		name,
 		distroGUID.Data1, distroGUID.Data2, distroGUID.Data3,
 		distroGUID.Data4[0], distroGUID.Data4[1], distroGUID.Data4[2],
@@ -635,6 +776,19 @@ func terminateDistribution(name string) (stdout, stderr string) {
 // Command dispatcher
 // ---------------------------------------------------------------------------
 
+// WSLImportPipe imports a WSL distribution from raw tarball bytes piped to COM.
+// This is the direct-call path used by the job service to avoid base64 encode/decode overhead.
+func WSLImportPipe(name string, data []byte, targetDir string) jobs.Results {
+	var results jobs.Results
+	results.Stdout, results.Stderr = importDistributionPipe(name, data, targetDir)
+	if results.Stderr != "" {
+		cli.Message(cli.WARN, results.Stderr)
+	} else if results.Stdout != "" {
+		cli.Message(cli.SUCCESS, results.Stdout)
+	}
+	return results
+}
+
 // WSLCommand dispatches WSL commands
 func WSLCommand(cmd jobs.Command) jobs.Results {
 	cli.Message(cli.NOTE, fmt.Sprintf("Executing WSL command: %s", cmd.Command))
@@ -670,6 +824,16 @@ func WSLCommand(cmd jobs.Command) jobs.Results {
 			targetDir = cmd.Args[3]
 		}
 		results.Stdout, results.Stderr = importDistributionPipe(cmd.Args[1], data, targetDir)
+	case "import-url":
+		if len(cmd.Args) < 3 {
+			results.Stderr = "wsl import-url requires a distribution name and URL"
+			return results
+		}
+		var targetDir string
+		if len(cmd.Args) > 3 {
+			targetDir = cmd.Args[3]
+		}
+		results.Stdout, results.Stderr = importDistributionURL(cmd.Args[1], cmd.Args[2], targetDir)
 	case "import-local":
 		if len(cmd.Args) < 3 {
 			results.Stderr = "wsl import-local requires a distribution name and file path"

