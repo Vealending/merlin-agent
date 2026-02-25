@@ -23,6 +23,7 @@ along with Merlin.  If not, see <http://www.gnu.org/licenses/>.
 package commands
 
 import (
+	"encoding/base64"
 	"fmt"
 	"runtime"
 	"strings"
@@ -141,12 +142,15 @@ const (
 	wslIF_Unknown
 )
 
-// vtable method indices
-// IUnknown: QueryInterface=0, AddRef=1, Release=2
+// vtable method indices — IUnknown: 0=QueryInterface, 1=AddRef, 2=Release
 // ILxssUserSession methods start at index 3
 const (
 	vtableRelease            = 2
-	vtableGetDistributionId  = 6 // Same across all versions
+	vtableRegisterDist       = 4 // RegisterDistribution (file handle)
+	vtableRegisterDistPipe   = 5 // RegisterDistributionPipe (pipe handle)
+	vtableGetDistributionId  = 6
+	vtableTerminateDist      = 7
+	vtableUnregisterDist     = 8
 )
 
 // createLxProcessIndex returns the vtable index for CreateLxProcess based on interface version
@@ -164,13 +168,480 @@ func hasInteropSocket(ifVer wslInterfaceVersion) bool {
 	return ifVer != wslIF_2_0_0_0
 }
 
-// WSLCommand dispatches WSL list/exec commands
+// ---------------------------------------------------------------------------
+// COM session helper
+// ---------------------------------------------------------------------------
+
+// comSession holds a COM session to the WSL service
+type comSession struct {
+	session uintptr
+	ifVer   wslInterfaceVersion
+	ver     wslVersion
+}
+
+// newCOMSession initializes COM and creates an ILxssUserSession.
+// The caller must invoke the returned cleanup function when done.
+func newCOMSession() (*comSession, func(), error) {
+	runtime.LockOSThread()
+
+	ver, err := getWSLVersion()
+	if err != nil {
+		runtime.UnlockOSThread()
+		return nil, nil, fmt.Errorf("failed to get WSL version: %w", err)
+	}
+
+	ifVer := determineInterfaceVersion(ver)
+	if ifVer == wslIF_Unknown {
+		runtime.UnlockOSThread()
+		return nil, nil, fmt.Errorf("unsupported WSL version: %d.%d.%d.%d", ver.Major, ver.Minor, ver.Build, ver.Revision)
+	}
+
+	cli.Message(cli.NOTE, fmt.Sprintf("WSL version: %d.%d.%d.%d (interface variant: %d)",
+		ver.Major, ver.Minor, ver.Build, ver.Revision, ifVer))
+
+	hr, _, _ := procCoInitializeEx.Call(0, coinitMultithreaded)
+	if int32(hr) < 0 {
+		runtime.UnlockOSThread()
+		return nil, nil, fmt.Errorf("CoInitializeEx failed: 0x%08X", uint32(hr))
+	}
+
+	hr, _, _ = procCoInitializeSec.Call(
+		0,                           // pSecDesc
+		uintptr(0xFFFFFFFFFFFFFFFF), // cAuthSvc = -1
+		0,                           // asAuthSvc
+		0,                           // pReserved1
+		rpcCAuthnLevelDefault,       // dwAuthnLevel
+		rpcCImpLevelImpersonate,     // dwImpLevel
+		0,                           // pAuthList
+		eoacStaticCloaking,          // dwCapabilities
+		0,                           // pReserved3
+	)
+	if int32(hr) < 0 && uint32(hr) != rpcETooLate {
+		cli.Message(cli.WARN, fmt.Sprintf("CoInitializeSecurity failed: 0x%08X (non-fatal)", uint32(hr)))
+	}
+
+	var session uintptr
+	hr, _, _ = procCoCreateInstance.Call(
+		uintptr(unsafe.Pointer(&clsidLxssUserSession)),
+		0,
+		clsctxLocalServer,
+		uintptr(unsafe.Pointer(&iidILxssUserSession)),
+		uintptr(unsafe.Pointer(&session)),
+	)
+	if int32(hr) < 0 || session == 0 {
+		procCoUninitialize.Call()
+		runtime.UnlockOSThread()
+		return nil, nil, fmt.Errorf("CoCreateInstance failed: 0x%08X\nMake sure WSL is installed and the WslService is running", uint32(hr))
+	}
+
+	cli.Message(cli.NOTE, "WSL COM session created successfully")
+
+	cleanup := func() {
+		comRelease(session)
+		procCoUninitialize.Call()
+		runtime.UnlockOSThread()
+	}
+
+	return &comSession{session: session, ifVer: ifVer, ver: ver}, cleanup, nil
+}
+
+// resolveDistroGUID looks up a distribution's GUID by name via GetDistributionId (vtable 6)
+func resolveDistroGUID(session uintptr, distro string) (windows.GUID, error) {
+	distroWide, err := syscall.UTF16PtrFromString(distro)
+	if err != nil {
+		return windows.GUID{}, fmt.Errorf("failed to convert distro name: %w", err)
+	}
+
+	var errorInfo lxssErrorInfo
+	var guid windows.GUID
+
+	_, err = comVtableCall(session, vtableGetDistributionId,
+		uintptr(unsafe.Pointer(distroWide)),
+		0, // Flags
+		uintptr(unsafe.Pointer(&errorInfo)),
+		uintptr(unsafe.Pointer(&guid)),
+	)
+	if err != nil {
+		errMsg := fmt.Sprintf("GetDistributionId failed for '%s': %s", distro, err)
+		if errorInfo.Member10 != 0 {
+			errStr := windows.UTF16PtrToString((*uint16)(unsafe.Pointer(errorInfo.Member10)))
+			errMsg += fmt.Sprintf("\nError detail: %s", errStr)
+		}
+		freeErrorInfo(&errorInfo)
+		return windows.GUID{}, fmt.Errorf("%s", errMsg)
+	}
+	freeErrorInfo(&errorInfo)
+
+	cli.Message(cli.NOTE, fmt.Sprintf("Resolved distro '%s' -> GUID: {%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+		distro, guid.Data1, guid.Data2, guid.Data3,
+		guid.Data4[0], guid.Data4[1], guid.Data4[2],
+		guid.Data4[3], guid.Data4[4], guid.Data4[5],
+		guid.Data4[6], guid.Data4[7]))
+
+	return guid, nil
+}
+
+// ---------------------------------------------------------------------------
+// Version-aware RegisterDistribution / RegisterDistributionPipe arg builder
+// ---------------------------------------------------------------------------
+
+// buildRegisterArgs constructs the version-aware parameter list for RegisterDistribution
+// (Proc4) or RegisterDistributionPipe (Proc5). The handle is a file HANDLE or pipe read HANDLE.
+//
+// Parameter layout per version:
+//
+//	v2.0-2.2  (8):  Name, Version, Handle, TargetDir, Flags, PkgFamily, Error, Guid
+//	v2.3      (9):  Name, Version, Handle, Stderr, TargetDir, Flags, PkgFamily, Error, Guid
+//	v2.4-2.5.1(10): Name, Version, Handle, Stderr, TargetDir, Flags, PkgFamily, InstalledName, Error, Guid
+//	v2.5.4+   (11): Name, Version, Handle, Stderr, TargetDir, Flags, VhdSize, PkgFamily, InstalledName, Error, Guid
+func buildRegisterArgs(
+	ifVer wslInterfaceVersion,
+	namePtr, handle, stderrPipe, targetDir uintptr,
+	installedName *uintptr,
+	errorInfo *lxssErrorInfo,
+	guid *windows.GUID,
+) []uintptr {
+	switch {
+	case ifVer <= wslIF_2_0_0_0:
+		return []uintptr{
+			namePtr,
+			2,      // WSL version 2
+			handle,
+			targetDir,
+			0, // Flags
+			0, // PackageFamilyName (NULL)
+			uintptr(unsafe.Pointer(errorInfo)),
+			uintptr(unsafe.Pointer(guid)),
+		}
+
+	case ifVer <= wslIF_2_3_21_0:
+		return []uintptr{
+			namePtr,
+			2,
+			handle,
+			stderrPipe,
+			targetDir,
+			0,
+			0,
+			uintptr(unsafe.Pointer(errorInfo)),
+			uintptr(unsafe.Pointer(guid)),
+		}
+
+	case ifVer <= wslIF_2_5_1_0:
+		return []uintptr{
+			namePtr,
+			2,
+			handle,
+			stderrPipe,
+			targetDir,
+			0,
+			0,
+			uintptr(unsafe.Pointer(installedName)),
+			uintptr(unsafe.Pointer(errorInfo)),
+			uintptr(unsafe.Pointer(guid)),
+		}
+
+	default:
+		// v2.5.4+: +VhdSize (ULONG64, single uintptr on x64)
+		return []uintptr{
+			namePtr,
+			2,
+			handle,
+			stderrPipe,
+			targetDir,
+			0, // Flags
+			0, // VhdSize (0 = default)
+			0, // PackageFamilyName (NULL)
+			uintptr(unsafe.Pointer(installedName)),
+			uintptr(unsafe.Pointer(errorInfo)),
+			uintptr(unsafe.Pointer(guid)),
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Import / Unregister / Terminate implementations
+// ---------------------------------------------------------------------------
+
+// importDistributionPipe imports a WSL distribution by streaming tarball data through
+// an anonymous pipe to RegisterDistributionPipe (Proc5). No file touches disk.
+func importDistributionPipe(name string, data []byte, targetDir string) (stdout, stderr string) {
+	cs, cleanup, err := newCOMSession()
+	if err != nil {
+		stderr = err.Error()
+		return
+	}
+	defer cleanup()
+
+	nameWide, err := syscall.UTF16PtrFromString(name)
+	if err != nil {
+		stderr = fmt.Sprintf("failed to convert distro name: %s", err)
+		return
+	}
+
+	var targetDirPtr uintptr
+	if targetDir != "" {
+		td, err := syscall.UTF16PtrFromString(targetDir)
+		if err != nil {
+			stderr = fmt.Sprintf("failed to convert target directory: %s", err)
+			return
+		}
+		targetDirPtr = uintptr(unsafe.Pointer(td))
+	}
+
+	// Create anonymous pipe for streaming the tarball to the WSL service
+	var readPipe, writePipe windows.Handle
+	sa := &windows.SecurityAttributes{InheritHandle: 1}
+	if err := windows.CreatePipe(&readPipe, &writePipe, sa, 0); err != nil {
+		stderr = fmt.Sprintf("CreatePipe failed: %s", err)
+		return
+	}
+
+	// Write tarball data to the pipe in a background goroutine.
+	// The COM call reads from the read end; backpressure is handled by the pipe buffer.
+	errCh := make(chan error, 1)
+	go func() {
+		defer windows.CloseHandle(writePipe)
+		offset := 0
+		for offset < len(data) {
+			var written uint32
+			chunk := data[offset:]
+			if len(chunk) > 65536 {
+				chunk = chunk[:65536]
+			}
+			if err := windows.WriteFile(writePipe, chunk, &written, nil); err != nil {
+				errCh <- fmt.Errorf("pipe write failed at offset %d: %w", offset, err)
+				return
+			}
+			offset += int(written)
+		}
+		errCh <- nil
+	}()
+
+	var errorInfo lxssErrorInfo
+	var distroGUID windows.GUID
+	var installedName uintptr
+
+	cli.Message(cli.NOTE, fmt.Sprintf("Importing distribution '%s' via pipe (%d bytes)...", name, len(data)))
+
+	args := buildRegisterArgs(cs.ifVer,
+		uintptr(unsafe.Pointer(nameWide)),
+		uintptr(readPipe),
+		0, // stderrPipe — not used for simplicity
+		targetDirPtr,
+		&installedName,
+		&errorInfo,
+		&distroGUID,
+	)
+
+	_, comErr := comVtableCall(cs.session, vtableRegisterDistPipe, args...)
+
+	// Close the read end now that the COM call completed
+	windows.CloseHandle(readPipe)
+
+	// Wait for the writer goroutine to finish
+	if writeErr := <-errCh; writeErr != nil {
+		cli.Message(cli.WARN, fmt.Sprintf("pipe writer: %s", writeErr))
+	}
+
+	if installedName != 0 {
+		procCoTaskMemFree.Call(installedName)
+	}
+
+	if comErr != nil {
+		errMsg := fmt.Sprintf("RegisterDistributionPipe failed: %s", comErr)
+		if errorInfo.Member10 != 0 {
+			errStr := windows.UTF16PtrToString((*uint16)(unsafe.Pointer(errorInfo.Member10)))
+			errMsg += fmt.Sprintf("\nError detail: %s", errStr)
+		}
+		freeErrorInfo(&errorInfo)
+		stderr = errMsg
+		return
+	}
+	freeErrorInfo(&errorInfo)
+
+	stdout = fmt.Sprintf("Successfully imported distribution '%s'\nGUID: {%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+		name,
+		distroGUID.Data1, distroGUID.Data2, distroGUID.Data3,
+		distroGUID.Data4[0], distroGUID.Data4[1], distroGUID.Data4[2],
+		distroGUID.Data4[3], distroGUID.Data4[4], distroGUID.Data4[5],
+		distroGUID.Data4[6], distroGUID.Data4[7])
+	return
+}
+
+// importDistributionFile imports a WSL distribution from a tarball file already present
+// on the target via RegisterDistribution (Proc4).
+func importDistributionFile(name, filePath, targetDir string) (stdout, stderr string) {
+	cs, cleanup, err := newCOMSession()
+	if err != nil {
+		stderr = err.Error()
+		return
+	}
+	defer cleanup()
+
+	nameWide, err := syscall.UTF16PtrFromString(name)
+	if err != nil {
+		stderr = fmt.Sprintf("failed to convert distro name: %s", err)
+		return
+	}
+
+	var targetDirPtr uintptr
+	if targetDir != "" {
+		td, err := syscall.UTF16PtrFromString(targetDir)
+		if err != nil {
+			stderr = fmt.Sprintf("failed to convert target directory: %s", err)
+			return
+		}
+		targetDirPtr = uintptr(unsafe.Pointer(td))
+	}
+
+	// Open the tarball file for reading
+	pathWide, err := syscall.UTF16PtrFromString(filePath)
+	if err != nil {
+		stderr = fmt.Sprintf("failed to convert file path: %s", err)
+		return
+	}
+	fileHandle, err := windows.CreateFile(
+		pathWide,
+		windows.GENERIC_READ,
+		windows.FILE_SHARE_READ,
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_ATTRIBUTE_NORMAL,
+		0,
+	)
+	if err != nil {
+		stderr = fmt.Sprintf("failed to open file '%s': %s", filePath, err)
+		return
+	}
+	defer windows.CloseHandle(fileHandle)
+
+	var errorInfo lxssErrorInfo
+	var distroGUID windows.GUID
+	var installedName uintptr
+
+	cli.Message(cli.NOTE, fmt.Sprintf("Importing distribution '%s' from file '%s'...", name, filePath))
+
+	args := buildRegisterArgs(cs.ifVer,
+		uintptr(unsafe.Pointer(nameWide)),
+		uintptr(fileHandle),
+		0, // stderrPipe
+		targetDirPtr,
+		&installedName,
+		&errorInfo,
+		&distroGUID,
+	)
+
+	_, comErr := comVtableCall(cs.session, vtableRegisterDist, args...)
+
+	if installedName != 0 {
+		procCoTaskMemFree.Call(installedName)
+	}
+
+	if comErr != nil {
+		errMsg := fmt.Sprintf("RegisterDistribution failed: %s", comErr)
+		if errorInfo.Member10 != 0 {
+			errStr := windows.UTF16PtrToString((*uint16)(unsafe.Pointer(errorInfo.Member10)))
+			errMsg += fmt.Sprintf("\nError detail: %s", errStr)
+		}
+		freeErrorInfo(&errorInfo)
+		stderr = errMsg
+		return
+	}
+	freeErrorInfo(&errorInfo)
+
+	stdout = fmt.Sprintf("Successfully imported distribution '%s' from '%s'\nGUID: {%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+		name, filePath,
+		distroGUID.Data1, distroGUID.Data2, distroGUID.Data3,
+		distroGUID.Data4[0], distroGUID.Data4[1], distroGUID.Data4[2],
+		distroGUID.Data4[3], distroGUID.Data4[4], distroGUID.Data4[5],
+		distroGUID.Data4[6], distroGUID.Data4[7])
+	return
+}
+
+// unregisterDistribution completely removes a WSL distribution via UnregisterDistribution (Proc8).
+func unregisterDistribution(name string) (stdout, stderr string) {
+	cs, cleanup, err := newCOMSession()
+	if err != nil {
+		stderr = err.Error()
+		return
+	}
+	defer cleanup()
+
+	guid, err := resolveDistroGUID(cs.session, name)
+	if err != nil {
+		stderr = err.Error()
+		return
+	}
+
+	var errorInfo lxssErrorInfo
+	_, err = comVtableCall(cs.session, vtableUnregisterDist,
+		uintptr(unsafe.Pointer(&guid)),
+		uintptr(unsafe.Pointer(&errorInfo)),
+	)
+	if err != nil {
+		errMsg := fmt.Sprintf("UnregisterDistribution failed: %s", err)
+		if errorInfo.Member10 != 0 {
+			errStr := windows.UTF16PtrToString((*uint16)(unsafe.Pointer(errorInfo.Member10)))
+			errMsg += fmt.Sprintf("\nError detail: %s", errStr)
+		}
+		freeErrorInfo(&errorInfo)
+		stderr = errMsg
+		return
+	}
+	freeErrorInfo(&errorInfo)
+
+	stdout = fmt.Sprintf("Successfully unregistered distribution '%s'", name)
+	return
+}
+
+// terminateDistribution stops a running WSL distribution via TerminateDistribution (Proc7).
+func terminateDistribution(name string) (stdout, stderr string) {
+	cs, cleanup, err := newCOMSession()
+	if err != nil {
+		stderr = err.Error()
+		return
+	}
+	defer cleanup()
+
+	guid, err := resolveDistroGUID(cs.session, name)
+	if err != nil {
+		stderr = err.Error()
+		return
+	}
+
+	var errorInfo lxssErrorInfo
+	_, err = comVtableCall(cs.session, vtableTerminateDist,
+		uintptr(unsafe.Pointer(&guid)),
+		uintptr(unsafe.Pointer(&errorInfo)),
+	)
+	if err != nil {
+		errMsg := fmt.Sprintf("TerminateDistribution failed: %s", err)
+		if errorInfo.Member10 != 0 {
+			errStr := windows.UTF16PtrToString((*uint16)(unsafe.Pointer(errorInfo.Member10)))
+			errMsg += fmt.Sprintf("\nError detail: %s", errStr)
+		}
+		freeErrorInfo(&errorInfo)
+		stderr = errMsg
+		return
+	}
+	freeErrorInfo(&errorInfo)
+
+	stdout = fmt.Sprintf("Successfully terminated distribution '%s'", name)
+	return
+}
+
+// ---------------------------------------------------------------------------
+// Command dispatcher
+// ---------------------------------------------------------------------------
+
+// WSLCommand dispatches WSL commands
 func WSLCommand(cmd jobs.Command) jobs.Results {
 	cli.Message(cli.NOTE, fmt.Sprintf("Executing WSL command: %s", cmd.Command))
 
 	var results jobs.Results
 	if len(cmd.Args) < 1 {
-		results.Stderr = "wsl command requires at least one argument: list or exec"
+		results.Stderr = "wsl command requires at least one argument"
 		return results
 	}
 
@@ -184,8 +655,45 @@ func WSLCommand(cmd jobs.Command) jobs.Results {
 			return results
 		}
 		results.Stdout, results.Stderr = execInWSL(cmd.Args[1], cmd.Args[2])
+	case "import":
+		if len(cmd.Args) < 3 {
+			results.Stderr = "wsl import requires a distribution name and base64-encoded tarball data"
+			return results
+		}
+		data, err := base64.StdEncoding.DecodeString(cmd.Args[2])
+		if err != nil {
+			results.Stderr = fmt.Sprintf("failed to decode tarball data: %s", err)
+			return results
+		}
+		var targetDir string
+		if len(cmd.Args) > 3 {
+			targetDir = cmd.Args[3]
+		}
+		results.Stdout, results.Stderr = importDistributionPipe(cmd.Args[1], data, targetDir)
+	case "import-local":
+		if len(cmd.Args) < 3 {
+			results.Stderr = "wsl import-local requires a distribution name and file path"
+			return results
+		}
+		var targetDir string
+		if len(cmd.Args) > 3 {
+			targetDir = cmd.Args[3]
+		}
+		results.Stdout, results.Stderr = importDistributionFile(cmd.Args[1], cmd.Args[2], targetDir)
+	case "unregister":
+		if len(cmd.Args) < 2 {
+			results.Stderr = "wsl unregister requires a distribution name"
+			return results
+		}
+		results.Stdout, results.Stderr = unregisterDistribution(cmd.Args[1])
+	case "terminate":
+		if len(cmd.Args) < 2 {
+			results.Stderr = "wsl terminate requires a distribution name"
+			return results
+		}
+		results.Stdout, results.Stderr = terminateDistribution(cmd.Args[1])
 	default:
-		results.Stderr = fmt.Sprintf("unknown wsl action: %s (use 'list' or 'exec')", action)
+		results.Stderr = fmt.Sprintf("unknown wsl action: %s", action)
 	}
 
 	if results.Stderr != "" {
@@ -195,6 +703,10 @@ func WSLCommand(cmd jobs.Command) jobs.Results {
 	}
 	return results
 }
+
+// ---------------------------------------------------------------------------
+// Registry-based distribution listing
+// ---------------------------------------------------------------------------
 
 // listDistributions enumerates installed WSL distributions from the registry
 func listDistributions() (stdout, stderr string) {
@@ -254,6 +766,10 @@ func listDistributions() (stdout, stderr string) {
 	stdout = sb.String()
 	return
 }
+
+// ---------------------------------------------------------------------------
+// WSL version detection and interface mapping
+// ---------------------------------------------------------------------------
 
 // getWSLVersion reads the installed WSL version from the registry
 func getWSLVersion() (wslVersion, error) {
@@ -322,6 +838,10 @@ func determineInterfaceVersion(v wslVersion) wslInterfaceVersion {
 	return wslIF_Unknown
 }
 
+// ---------------------------------------------------------------------------
+// COM helpers
+// ---------------------------------------------------------------------------
+
 // comVtableCall calls a COM interface method by vtable index using SyscallN
 func comVtableCall(iface uintptr, methodIndex uintptr, args ...uintptr) (uintptr, error) {
 	vtable := *(*uintptr)(unsafe.Pointer(iface))
@@ -354,6 +874,10 @@ func freeErrorInfo(ei *lxssErrorInfo) {
 		procCoTaskMemFree.Call(ei.Member18)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Winsock helpers (used by execInWSL)
+// ---------------------------------------------------------------------------
 
 // readSocketOutput reads all available data from a socket handle in non-blocking mode with a timeout
 func readSocketOutput(sock uintptr, timeout time.Duration) string {
@@ -393,29 +917,20 @@ func readSocketOutput(sock uintptr, timeout time.Duration) string {
 	return sb.String()
 }
 
+// ---------------------------------------------------------------------------
+// Exec via CreateLxProcess (refactored to use newCOMSession)
+// ---------------------------------------------------------------------------
+
 // execInWSL creates a process inside a WSL distribution via COM and captures output
 func execInWSL(distro, command string) (stdout, stderr string) {
-	// Lock this goroutine to an OS thread for COM apartment threading
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
-	// Get WSL version
-	ver, err := getWSLVersion()
+	cs, cleanup, err := newCOMSession()
 	if err != nil {
-		stderr = fmt.Sprintf("failed to get WSL version: %s", err)
+		stderr = err.Error()
 		return
 	}
+	defer cleanup()
 
-	ifVer := determineInterfaceVersion(ver)
-	if ifVer == wslIF_Unknown {
-		stderr = fmt.Sprintf("unsupported WSL version: %d.%d.%d.%d", ver.Major, ver.Minor, ver.Build, ver.Revision)
-		return
-	}
-
-	cli.Message(cli.NOTE, fmt.Sprintf("WSL version: %d.%d.%d.%d (interface variant: %d)",
-		ver.Major, ver.Minor, ver.Build, ver.Revision, ifVer))
-
-	// Initialize Winsock
+	// Initialize Winsock (needed for socket-based stdout/stderr from CreateLxProcess)
 	var wsa wsaData
 	r1, _, _ := procWSAStartup.Call(uintptr(0x0202), uintptr(unsafe.Pointer(&wsa)))
 	if r1 != 0 {
@@ -424,80 +939,12 @@ func execInWSL(distro, command string) (stdout, stderr string) {
 	}
 	defer procWSACleanup.Call()
 
-	// Initialize COM (multithreaded)
-	hr, _, _ := procCoInitializeEx.Call(0, coinitMultithreaded)
-	if int32(hr) < 0 {
-		stderr = fmt.Sprintf("CoInitializeEx failed: 0x%08X", uint32(hr))
-		return
-	}
-	defer procCoUninitialize.Call()
-
-	// Initialize COM security
-	hr, _, _ = procCoInitializeSec.Call(
-		0,                           // pSecDesc
-		uintptr(0xFFFFFFFFFFFFFFFF), // cAuthSvc = -1
-		0,                           // asAuthSvc
-		0,                           // pReserved1
-		rpcCAuthnLevelDefault,       // dwAuthnLevel
-		rpcCImpLevelImpersonate,     // dwImpLevel
-		0,                           // pAuthList
-		eoacStaticCloaking,          // dwCapabilities
-		0,                           // pReserved3
-	)
-	if int32(hr) < 0 && uint32(hr) != rpcETooLate {
-		cli.Message(cli.WARN, fmt.Sprintf("CoInitializeSecurity failed: 0x%08X (non-fatal)", uint32(hr)))
-	}
-
-	// Create WSL session instance
-	var session uintptr
-	hr, _, _ = procCoCreateInstance.Call(
-		uintptr(unsafe.Pointer(&clsidLxssUserSession)),
-		0,
-		clsctxLocalServer,
-		uintptr(unsafe.Pointer(&iidILxssUserSession)),
-		uintptr(unsafe.Pointer(&session)),
-	)
-	if int32(hr) < 0 || session == 0 {
-		stderr = fmt.Sprintf("CoCreateInstance failed: 0x%08X\nMake sure WSL is installed and the WslService is running", uint32(hr))
-		return
-	}
-	defer comRelease(session)
-
-	cli.Message(cli.NOTE, "WSL COM session created successfully")
-
 	// Get distribution GUID
-	distroWide, err := syscall.UTF16PtrFromString(distro)
+	distroGUID, err := resolveDistroGUID(cs.session, distro)
 	if err != nil {
-		stderr = fmt.Sprintf("failed to convert distro name: %s", err)
+		stderr = err.Error()
 		return
 	}
-
-	var errorInfo lxssErrorInfo
-	var distroGUID windows.GUID
-
-	_, err = comVtableCall(session, vtableGetDistributionId,
-		uintptr(unsafe.Pointer(distroWide)),
-		0, // Flags
-		uintptr(unsafe.Pointer(&errorInfo)),
-		uintptr(unsafe.Pointer(&distroGUID)),
-	)
-	if err != nil {
-		errMsg := fmt.Sprintf("GetDistributionId failed: %s", err)
-		if errorInfo.Member10 != 0 {
-			errStr := windows.UTF16PtrToString((*uint16)(unsafe.Pointer(errorInfo.Member10)))
-			errMsg += fmt.Sprintf("\nError detail: %s", errStr)
-		}
-		freeErrorInfo(&errorInfo)
-		stderr = errMsg
-		return
-	}
-	freeErrorInfo(&errorInfo)
-
-	cli.Message(cli.NOTE, fmt.Sprintf("Found distro GUID: {%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
-		distroGUID.Data1, distroGUID.Data2, distroGUID.Data3,
-		distroGUID.Data4[0], distroGUID.Data4[1], distroGUID.Data4[2],
-		distroGUID.Data4[3], distroGUID.Data4[4], distroGUID.Data4[5],
-		distroGUID.Data4[6], distroGUID.Data4[7]))
 
 	// Build command line: /bin/bash -c "<command>"
 	bashPath, _ := syscall.BytePtrFromString("/bin/bash")
@@ -531,7 +978,7 @@ func execInWSL(distro, command string) (stdout, stderr string) {
 	)
 
 	// Call CreateLxProcess — argument list depends on version
-	createIdx := createLxProcessIndex(ifVer)
+	createIdx := createLxProcessIndex(cs.ifVer)
 	var createArgs []uintptr
 
 	baseArgs := []uintptr{
@@ -559,7 +1006,7 @@ func execInWSL(distro, command string) (stdout, stderr string) {
 		uintptr(unsafe.Pointer(&commChannel)),        // out: CommunicationChannel
 	}
 
-	if hasInteropSocket(ifVer) {
+	if hasInteropSocket(cs.ifVer) {
 		createArgs = append(baseArgs,
 			uintptr(unsafe.Pointer(&interopSocket)),  // out: InteropSocket
 			uintptr(unsafe.Pointer(&createError)),    // out: Error
@@ -570,7 +1017,7 @@ func execInWSL(distro, command string) (stdout, stderr string) {
 		)
 	}
 
-	_, err = comVtableCall(session, createIdx, createArgs...)
+	_, err = comVtableCall(cs.session, createIdx, createArgs...)
 	if err != nil {
 		errMsg := fmt.Sprintf("CreateLxProcess failed: %s", err)
 		if createError.Member10 != 0 {
