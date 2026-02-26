@@ -67,11 +67,12 @@ var (
 	procCoTaskMemFree     = modOle32.NewProc("CoTaskMemFree")
 
 	modWs2_32        = windows.NewLazySystemDLL("ws2_32.dll")
-	procWSAStartup   = modWs2_32.NewProc("WSAStartup")
-	procWSACleanup   = modWs2_32.NewProc("WSACleanup")
-	procRecv         = modWs2_32.NewProc("recv")
-	procIoctlSocket  = modWs2_32.NewProc("ioctlsocket")
-	procClosesocket  = modWs2_32.NewProc("closesocket")
+	procWSAStartup      = modWs2_32.NewProc("WSAStartup")
+	procWSACleanup      = modWs2_32.NewProc("WSACleanup")
+	procWSAGetLastError = modWs2_32.NewProc("WSAGetLastError")
+	procRecv            = modWs2_32.NewProc("recv")
+	procIoctlSocket     = modWs2_32.NewProc("ioctlsocket")
+	procClosesocket     = modWs2_32.NewProc("closesocket")
 )
 
 // COM constants
@@ -1043,42 +1044,71 @@ func freeErrorInfo(ei *lxssErrorInfo) {
 // Winsock helpers (used by execInWSL)
 // ---------------------------------------------------------------------------
 
-// readSocketOutput reads all available data from a socket handle in non-blocking mode with a timeout
-func readSocketOutput(sock uintptr, timeout time.Duration) string {
+// drainSocket reads all data from a socket until it closes or the done channel signals.
+// Results are sent back on the result channel.
+func drainSocket(sock uintptr, done <-chan struct{}, result chan<- string) {
 	if sock == 0 {
-		return ""
+		result <- ""
+		return
 	}
 
-	// Set non-blocking
+	// Set non-blocking mode — if this fails, recv will block and we cannot
+	// respect the done channel, so bail out rather than risk a deadlock.
 	mode := uint32(1)
-	procIoctlSocket.Call(sock, fionbio, uintptr(unsafe.Pointer(&mode)))
+	r, _, _ := procIoctlSocket.Call(sock, fionbio, uintptr(unsafe.Pointer(&mode)))
+	if r != 0 {
+		result <- ""
+		return
+	}
 
 	var sb strings.Builder
 	buf := make([]byte, bufferSize)
-	deadline := time.Now().Add(timeout)
 
-	for time.Now().Before(deadline) {
-		r1, _, _ := procRecv.Call(
-			sock,
-			uintptr(unsafe.Pointer(&buf[0])),
-			uintptr(len(buf)-1),
-			0,
-		)
-		n := int(int32(r1))
-		if n > 0 {
-			sb.Write(buf[:n])
-			// Reset deadline on successful read — more data may follow
-			deadline = time.Now().Add(500 * time.Millisecond)
-		} else if n == 0 {
-			// Connection closed
-			break
-		} else {
-			// WSAEWOULDBLOCK or error — brief pause then retry
-			time.Sleep(100 * time.Millisecond)
+	for {
+		select {
+		case <-done:
+			// Process exited — do a final drain capped at 2 seconds absolute
+			hardDeadline := time.Now().Add(2 * time.Second)
+			softDeadline := time.Now().Add(500 * time.Millisecond)
+			for time.Now().Before(softDeadline) && time.Now().Before(hardDeadline) {
+				r1, _, _ := procRecv.Call(sock, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)-1), 0)
+				n := int(int32(r1))
+				if n > 0 {
+					sb.Write(buf[:n])
+					softDeadline = time.Now().Add(200 * time.Millisecond)
+				} else if n == 0 {
+					break
+				} else {
+					time.Sleep(50 * time.Millisecond)
+				}
+			}
+			result <- sb.String()
+			return
+		default:
+			r1, _, _ := procRecv.Call(sock, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)-1), 0)
+			n := int(int32(r1))
+			if n > 0 {
+				sb.Write(buf[:n])
+			} else if n == 0 {
+				// Connection closed by remote
+				result <- sb.String()
+				return
+			} else {
+				// Check for real errors vs WSAEWOULDBLOCK (10035)
+				errno := int(r1) // r1 is SOCKET_ERROR (-1), actual error from WSAGetLastError
+				if errno == -1 {
+					// Use WSAGetLastError to distinguish
+					wsaErr, _, _ := procWSAGetLastError.Call()
+					if wsaErr != 10035 { // WSAEWOULDBLOCK
+						// Real socket error — stop reading
+						result <- sb.String()
+						return
+					}
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
 		}
 	}
-
-	return sb.String()
 }
 
 // ---------------------------------------------------------------------------
@@ -1225,31 +1255,40 @@ func execInWSL(distro, command string) (stdout, stderr string) {
 		}
 	}()
 
-	// Wait briefly for process to produce output, then drain sockets
-	time.Sleep(2 * time.Second)
+	// Drain stdout/stderr concurrently while waiting for process exit
+	done := make(chan struct{})
+	stdoutCh := make(chan string, 1)
+	stderrCh := make(chan string, 1)
 
-	var sb strings.Builder
-	outData := readSocketOutput(stdoutSock, 3*time.Second)
-	errData := readSocketOutput(stderrSock, 1*time.Second)
+	go drainSocket(stdoutSock, done, stdoutCh)
+	go drainSocket(stderrSock, done, stderrCh)
 
-	if outData != "" {
-		sb.WriteString(outData)
-	}
-
-	// Wait for process completion
+	// Wait for process to exit (2 minute timeout)
 	if processHandle != 0 {
-		event, _ := windows.WaitForSingleObject(windows.Handle(processHandle), 10000)
-		if event == windows.WAIT_OBJECT_0 {
+		event, _ := windows.WaitForSingleObject(windows.Handle(processHandle), 120000)
+		switch event {
+		case windows.WAIT_OBJECT_0:
 			var exitCode uint32
-			if windows.GetExitCodeProcess(windows.Handle(processHandle), &exitCode) == nil {
-				sb.WriteString(fmt.Sprintf("\nProcess exited with code: %d", exitCode))
+			if windows.GetExitCodeProcess(windows.Handle(processHandle), &exitCode) == nil && exitCode != 0 {
+				stderr = fmt.Sprintf("Process exited with code: %d", exitCode)
 			}
+		case uint32(0x00000102): // WAIT_TIMEOUT
+			stderr = "Process timed out after 2 minutes"
+		default:
+			stderr = fmt.Sprintf("WaitForSingleObject returned unexpected status: 0x%X", event)
 		}
 	}
 
-	stdout = sb.String()
+	// Signal drain goroutines to finish and collect output
+	close(done)
+	stdout = <-stdoutCh
+	errData := <-stderrCh
 	if errData != "" {
-		stderr = errData
+		if stderr != "" {
+			stderr = errData + "\n" + stderr
+		} else {
+			stderr = errData
+		}
 	}
 	return
 }
