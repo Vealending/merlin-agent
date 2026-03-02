@@ -16,6 +16,7 @@ require (
 	github.com/go-jose/go-jose/v3 v3.0.4
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510
 	github.com/google/uuid v1.6.0
+	github.com/gorilla/websocket v1.5.3
 	github.com/quic-go/quic-go v0.50.1
 	github.com/refraction-networking/utls v1.6.7
 	golang.org/x/crypto v0.37.0
