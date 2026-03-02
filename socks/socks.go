@@ -37,8 +37,13 @@ import (
 	"github.com/Ne0nd0g/merlin-message/jobs"
 )
 
-var server *socks5.Server
-var connections = sync.Map{}
+var (
+	server     *socks5.Server
+	serverOnce sync.Once
+	serverErr  error
+	connections = sync.Map{}
+	tombstones  = sync.Map{} // maps uuid.UUID → struct{}; prevents orphan recreation after teardown
+)
 
 // Connection is a structure used to track new SOCKS client connections
 type Connection struct {
@@ -59,6 +64,7 @@ func (c *Connection) teardown(id uuid.UUID) {
 		c.Out.Close()
 		c.In.Close()
 		connections.Delete(id)
+		tombstones.Store(id, struct{}{})
 		close(c.done)
 	})
 }
@@ -68,34 +74,46 @@ func (c *Connection) teardown(id uuid.UUID) {
 func Handler(msg jobs.Job, jobsOut *chan jobs.Job) {
 	job := msg.Payload.(jobs.Socks)
 
-	// See if the SOCKS server has already been created
-	if server == nil {
-		err := newSOCKSServer()
-		if err != nil {
-			cli.Message(cli.WARN, err.Error())
-			return
-		}
+	// Initialize the SOCKS5 server exactly once
+	serverOnce.Do(func() {
+		serverErr = newSOCKSServer()
+	})
+	if serverErr != nil {
+		cli.Message(cli.WARN, serverErr.Error())
+		return
 	}
 
-	// See if this connection is new
-	_, ok := connections.Load(job.ID)
-	if !ok && !job.Close {
-		client, target := net.Pipe()
-		in := make(chan jobs.Socks, 100)
-		connection := Connection{
-			Job:     msg,
-			In:      client,
-			Out:     target,
-			JobChan: jobsOut,
-			in:      &in,
-			done:    make(chan struct{}),
+	// Atomically check-and-create to prevent TOCTOU race on same connection ID
+	if !job.Close {
+		_, loaded := connections.Load(job.ID)
+		if !loaded {
+			// Refuse to recreate a connection that was already torn down
+			if _, tombstoned := tombstones.Load(job.ID); tombstoned {
+				cli.Message(cli.DEBUG, fmt.Sprintf("ignoring late data for tombstoned connection %s", job.ID))
+				return
+			}
+			client, target := net.Pipe()
+			in := make(chan jobs.Socks, 100)
+			connection := Connection{
+				Job:     msg,
+				In:      client,
+				Out:     target,
+				JobChan: jobsOut,
+				in:      &in,
+				done:    make(chan struct{}),
+			}
+			_, raced := connections.LoadOrStore(job.ID, &connection)
+			if !raced {
+				// We won — start the goroutines
+				go start(job.ID)
+				go listen(job.ID)
+				go send(job.ID)
+			} else {
+				// Another goroutine created this connection first — clean up
+				client.Close()
+				target.Close()
+			}
 		}
-		connections.Store(job.ID, &connection)
-
-		// Start the go routines to serve the SOCKS connection
-		go start(job.ID)
-		go listen(job.ID)
-		go send(job.ID)
 	}
 
 	conn, ok := connections.Load(job.ID)
@@ -190,7 +208,11 @@ func listen(id uuid.UUID) {
 			Index: i,
 			Data:  chunk,
 		}
-		*c.JobChan <- job
+		select {
+		case *c.JobChan <- job:
+		case <-c.done:
+			return
+		}
 		i++
 	}
 }
@@ -205,22 +227,33 @@ func send(id uuid.UUID) {
 	c := conn.(*Connection)
 	defer c.teardown(id)
 
+	var pending []jobs.Socks
+
 	for {
-		// Get SOCKS job from the channel, with done-awareness
 		var job jobs.Socks
-		select {
-		case job = <-*c.in:
-		case <-c.done:
-			return
+		var found bool
+
+		// Check pending slice first for the expected index
+		for i, p := range pending {
+			if p.Index == c.Count {
+				job = p
+				pending = append(pending[:i], pending[i+1:]...)
+				found = true
+				break
+			}
 		}
 
-		// Check to ensure the index is correct, if not, return it to the channel to be processed again
-		if c.Count != job.Index {
+		if !found {
 			select {
-			case *c.in <- job:
+			case job = <-*c.in:
 			case <-c.done:
 				return
 			}
+		}
+
+		// Out-of-order: stash locally instead of requeuing to the channel
+		if c.Count != job.Index {
+			pending = append(pending, job)
 			runtime.Gosched()
 			continue
 		}
