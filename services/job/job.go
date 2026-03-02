@@ -91,12 +91,25 @@ func (s *Service) AddResult(agent uuid.UUID, stdOut, stdErr string) {
 	out <- job
 }
 
-// Get blocks waiting for a job from the out channel
+// Get blocks waiting for a job from the out channel, then drains up to maxBatch-1 more
 func (s *Service) Get() []jobs.Job {
 	cli.Message(cli.DEBUG, "services/job.Get(): entering into function")
+	// Block until at least one job is available
 	job := <-out
-	cli.Message(cli.DEBUG, fmt.Sprintf("services/job.Check(): leaving function with: %+v", job))
-	return []jobs.Job{job}
+	returnJobs := []jobs.Job{job}
+	// Drain additional pending jobs without blocking (up to cap)
+	const maxBatch = 50
+	for len(returnJobs) < maxBatch {
+		select {
+		case j := <-out:
+			returnJobs = append(returnJobs, j)
+		default:
+			cli.Message(cli.DEBUG, fmt.Sprintf("services/job.Get(): leaving function with %d jobs", len(returnJobs)))
+			return returnJobs
+		}
+	}
+	cli.Message(cli.DEBUG, fmt.Sprintf("services/job.Get(): leaving function with %d jobs (hit cap)", len(returnJobs)))
+	return returnJobs
 }
 
 // Check does not block and returns any jobs ready to be returned to the Merlin server

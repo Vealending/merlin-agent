@@ -23,9 +23,9 @@ package socks
 
 import (
 	// Standard
-	"bytes"
 	"fmt"
 	"net"
+	"runtime"
 	"sync"
 
 	// 3rd Party
@@ -137,12 +137,12 @@ func listen(id uuid.UUID) {
 	// Loop 2 - SOCKS client request
 	// Loop 3 - Client data
 
+	// Allocate read buffer once; copy to right-sized slice before sending
+	buf := make([]byte, 500000)
 	for {
-		data := make([]byte, 500000)
-
-		n, err := connection.(*Connection).Out.Read(data)
+		n, err := connection.(*Connection).Out.Read(buf)
 		cli.Message(cli.DEBUG, fmt.Sprintf("Read %d bytes from the OUTBOUND pipe with error %s", n, err))
-		//fmt.Printf("[+] Read %d bytes from the OUTBOUND pipe %s with error %s, Data: %x\n", n, id, err, data[:n])
+
 		// Check to see if we closed the connection because we are done with it
 		fin, good := done.Load(id)
 		if !good {
@@ -156,15 +156,18 @@ func listen(id uuid.UUID) {
 
 		if err != nil {
 			cli.Message(cli.WARN, fmt.Sprintf("there was an error reading from the OUTBOUND pipe: %s", err))
-			//fmt.Printf("ERROR reading %d bytes for ID: %s, Index: %d, Close: %t, Data Length: %d, Error: %s\n", n, id, i, j.Payload.(jobs.Socks).Close, len(j.Payload.(jobs.Socks).Data), err)
 			return
 		}
+
+		// Copy to right-sized slice (safe: buf is reused, chunk is independent)
+		chunk := make([]byte, n)
+		copy(chunk, buf[:n])
 
 		// Return data to the client
 		job.Payload = jobs.Socks{
 			ID:    id,
 			Index: i,
-			Data:  data[:n],
+			Data:  chunk,
 		}
 		*connection.(*Connection).JobChan <- job
 		i++
@@ -186,6 +189,7 @@ func send(id uuid.UUID) {
 		// Check to ensure the index is correct, if not, return it to the channel to be processed again
 		if conn.(*Connection).Count != job.Index {
 			*conn.(*Connection).in <- job
+			runtime.Gosched()
 			continue
 		}
 
@@ -193,16 +197,8 @@ func send(id uuid.UUID) {
 		// Send data, if any, before closing the connection
 		if len(job.Data) > 0 {
 			conn.(*Connection).Count++
-			// Write the received data to the agent side pipe
-			var buff bytes.Buffer
-			_, err := buff.Write(job.Data)
-			if err != nil {
-				cli.Message(cli.WARN, fmt.Sprintf("there was an error writing SOCKS data to the buffer: %s", err))
-				return
-			}
-
-			//fmt.Printf("Writing %d bytes to SOCKS target \n", len(job.Data))
-			n, err := conn.(*Connection).Out.Write(buff.Bytes())
+			// Write the received data directly to the agent side pipe
+			n, err := conn.(*Connection).Out.Write(job.Data)
 			if err != nil {
 				cli.Message(cli.WARN, fmt.Sprintf("there was an error writing data to the SOCKS %s OUTBOUND pipe: %s", job.ID, err))
 				return
