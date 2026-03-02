@@ -339,8 +339,6 @@ func (client *Client) Listen() (returnMessages []messages.Base, err error) {
 
 func (client *Client) proxy() (err error) {
 	cli.Message(cli.DEBUG, fmt.Sprintf("clients/http.proxy(): Sending CONNECT request to proxy: %s", client.Proxy))
-	fmt.Printf("clients/http.proxy(): client.URL: %+v\n", client.URL[client.currentURL])
-
 	req, err := http.NewRequest("CONNECT", client.URL[client.currentURL], nil)
 	if err != nil {
 		err = fmt.Errorf("there was an error building the HTTP CONNECT request: %s", err)

@@ -115,16 +115,17 @@ func (s *Service) Get() []jobs.Job {
 // Check does not block and returns any jobs ready to be returned to the Merlin server
 func (s *Service) Check() (returnJobs []jobs.Job) {
 	cli.Message(cli.DEBUG, "services/job.Check(): entering into function")
-	// Check the output channel
-	for {
-		if len(out) > 0 {
-			job := <-out
+	const maxBatch = 50
+	for len(returnJobs) < maxBatch {
+		select {
+		case job := <-out:
 			returnJobs = append(returnJobs, job)
-		} else {
-			break
+		default:
+			cli.Message(cli.DEBUG, fmt.Sprintf("services/job.Check(): Leaving function with %+v", returnJobs))
+			return returnJobs
 		}
 	}
-	cli.Message(cli.DEBUG, fmt.Sprintf("services/job.Check(): Leaving function with %+v", returnJobs))
+	cli.Message(cli.DEBUG, fmt.Sprintf("services/job.Check(): Leaving function with %d jobs (hit cap)", len(returnJobs)))
 	return returnJobs
 }
 
