@@ -312,7 +312,9 @@ func New(config Config) (*Client, error) {
 // the process or needs to re-authenticate.
 func (client *Client) Authenticate(msg messages.Base) (err error) {
 	cli.Message(cli.DEBUG, "Entering into clients.mythic.Authenticate()...")
-	cli.Message(cli.DEBUG, fmt.Sprintf("Input Merlin message base:\n%+v", msg))
+	if core.Debug {
+		cli.Message(cli.DEBUG, fmt.Sprintf("Input Merlin message base:\n%+v", msg))
+	}
 
 	client.authenticated = false
 	var authenticated bool
@@ -382,7 +384,9 @@ func (client *Client) Synchronous() bool {
 // This is where the client's logic is for communicating with the server.
 func (client *Client) Send(m messages.Base) (returnMessages []messages.Base, err error) {
 	cli.Message(cli.DEBUG, "Entering into clients.mythic.Send()...")
-	cli.Message(cli.DEBUG, fmt.Sprintf("input message base:\n%+v", m))
+	if core.Debug {
+		cli.Message(cli.DEBUG, fmt.Sprintf("input message base:\n%+v", m))
+	}
 
 	// Set the message padding
 	if client.PaddingMax > 0 {
@@ -806,7 +810,9 @@ func (client *Client) Deconstruct(data []byte) (returnMessages []messages.Base, 
 		}
 		// If there are any tasks/jobs, add them
 		if len(msg.Tasks) > 0 {
-			cli.Message(cli.DEBUG, fmt.Sprintf("returned Mythic tasks:\n%+v", msg))
+			if core.Debug {
+				cli.Message(cli.DEBUG, fmt.Sprintf("returned Mythic tasks:\n%+v", msg))
+			}
 			returnMessage, err = client.convertTasksToJobs(msg.Tasks)
 			if err != nil {
 				return
@@ -843,7 +849,9 @@ func (client *Client) Deconstruct(data []byte) (returnMessages []messages.Base, 
 				returnMessages = append(returnMessages, returnMessage)
 			}
 		}
-		cli.Message(cli.DEBUG, fmt.Sprintf("post_response results from the server: %+v", msg))
+		if core.Debug {
+			cli.Message(cli.DEBUG, fmt.Sprintf("post_response results from the server: %+v", msg))
+		}
 		for _, response := range msg.Responses {
 			if response.Error != "" {
 				cli.Message(cli.WARN, fmt.Sprintf("There was an error sending a task to the Mythic server:\n%+v", response))
@@ -890,7 +898,9 @@ func (client *Client) Deconstruct(data []byte) (returnMessages []messages.Base, 
 // encrypts it, prepends the Mythic UUID, and Base64 encodes the entire string
 func (client *Client) Construct(m messages.Base) ([]byte, error) {
 	cli.Message(cli.DEBUG, "Entering into clients.mythic.Construct()...")
-	cli.Message(cli.DEBUG, fmt.Sprintf("Input Merlin message base:\n %+v", m))
+	if core.Debug {
+		cli.Message(cli.DEBUG, fmt.Sprintf("Input Merlin message base:\n %+v", m))
+	}
 
 	var err error
 	var data []byte
@@ -1117,7 +1127,9 @@ func (client *Client) Construct(m messages.Base) ([]byte, error) {
 		} else {
 			data, err = client.transformers[i-1].Construct(data, client.secret)
 		}
-		cli.Message(cli.DEBUG, fmt.Sprintf("%d call with transform %s - Constructed data(%d) %T: %X\n", i, client.transformers[i-1], len(data), data, data))
+		if core.Debug {
+			cli.Message(cli.DEBUG, fmt.Sprintf("%d call with transform %s - Constructed data(%d) %T: %X\n", i, client.transformers[i-1], len(data), data, data))
+		}
 		if err != nil {
 			return []byte{}, fmt.Errorf("there was an error transforming the Mythic task:\n%s", err)
 		}
@@ -1128,7 +1140,9 @@ func (client *Client) Construct(m messages.Base) ([]byte, error) {
 
 // convertSocksToJobs takes in Mythic socks messages and translates them into Merlin jobs
 func (client *Client) convertSocksToJobs(socks []Socks) (base messages.Base, err error) {
-	cli.Message(cli.DEBUG, fmt.Sprintf("Entering into clients.mythic.convertSocksToJobs() with %+v", socks))
+	if core.Debug {
+		cli.Message(cli.DEBUG, fmt.Sprintf("Entering into clients.mythic.convertSocksToJobs() with %+v", socks))
+	}
 	//fmt.Printf("Entering into clients.mythic.convertSocksToJobs() with %d socks messages: %+v\n", len(socks), socks)
 
 	base.Type = messages.JOBS
@@ -1188,7 +1202,9 @@ func (client *Client) convertSocksToJobs(socks []Socks) (base messages.Base, err
 // convertTasksToJobs is a function that converts Mythic tasks into a Merlin jobs structure
 func (client *Client) convertTasksToJobs(tasks []Task) (messages.Base, error) {
 	cli.Message(cli.DEBUG, "Entering into clients.mythic.convertTasksToJobs()")
-	cli.Message(cli.DEBUG, fmt.Sprintf("Input task:\n%+v", tasks))
+	if core.Debug {
+		cli.Message(cli.DEBUG, fmt.Sprintf("Input task:\n%+v", tasks))
+	}
 
 	// Merlin messages.Base structure
 	base := messages.Base{

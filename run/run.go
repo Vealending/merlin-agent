@@ -187,7 +187,9 @@ func checkIn() {
 	for _, base := range bases {
 		cli.Message(cli.DEBUG, fmt.Sprintf("Agent ID: %s", base.ID))
 		cli.Message(cli.DEBUG, fmt.Sprintf("Message Type: %s", base.Type))
-		cli.Message(cli.DEBUG, fmt.Sprintf("Message Payload: %+v", base.Payload))
+		if core.Debug {
+			cli.Message(cli.DEBUG, fmt.Sprintf("Message Payload: %+v", base.Payload))
+		}
 
 		// Handle message
 		err = messageService.Handle(base)

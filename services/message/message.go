@@ -34,6 +34,7 @@ import (
 
 	// Internal
 	"github.com/Ne0nd0g/merlin-agent/v2/cli"
+	"github.com/Ne0nd0g/merlin-agent/v2/core"
 	"github.com/Ne0nd0g/merlin-agent/v2/services/client"
 	"github.com/Ne0nd0g/merlin-agent/v2/services/job"
 	"github.com/Ne0nd0g/merlin-agent/v2/services/p2p"
@@ -84,7 +85,9 @@ func (s *Service) Check() (msg messages.Base) {
 	if len(delegates) > 0 {
 		msg.Delegates = delegates
 	}
-	cli.Message(cli.DEBUG, fmt.Sprintf("services/message.Check(): leaving function with %+v", msg))
+	if core.Debug {
+		cli.Message(cli.DEBUG, fmt.Sprintf("services/message.Check(): leaving function with %+v", msg))
+	}
 	return
 }
 
@@ -92,7 +95,9 @@ func (s *Service) Check() (msg messages.Base) {
 func (s *Service) Get() (msg messages.Base) {
 	cli.Message(cli.DEBUG, "services/message.Get(): entering into function")
 	msg = <-out
-	cli.Message(cli.DEBUG, fmt.Sprintf("services/message.Get(): leaving function with %+v", msg))
+	if core.Debug {
+		cli.Message(cli.DEBUG, fmt.Sprintf("services/message.Get(): leaving function with %+v", msg))
+	}
 	return
 }
 
@@ -124,19 +129,25 @@ func (s *Service) GetJobs() {
 			Type: messages.JOBS,
 		}
 		msg.Payload = s.JobService.Get()
-		cli.Message(cli.DEBUG, fmt.Sprintf("services/message.getJobs(): added message Base to outgoing message channel: %+v\n", msg))
+		if core.Debug {
+			cli.Message(cli.DEBUG, fmt.Sprintf("services/message.getJobs(): added message Base to outgoing message channel: %+v\n", msg))
+		}
 		out <- msg
 	}
 }
 
 // Handle processes incoming Base messages for this Agent
 func (s *Service) Handle(msg messages.Base) (err error) {
-	cli.Message(cli.DEBUG, fmt.Sprintf("services/messages.Handle(): Entering into function with: %+v", msg))
-	defer cli.Message(cli.DEBUG, fmt.Sprintf("services/messages.Handle(): Leaving function with error: %+v", err))
+	if core.Debug {
+		cli.Message(cli.DEBUG, fmt.Sprintf("services/messages.Handle(): Entering into function with: %+v", msg))
+		defer func() {
+			cli.Message(cli.DEBUG, fmt.Sprintf("services/messages.Handle(): Leaving function with error: %+v", err))
+		}()
+	}
 	cli.Message(cli.SUCCESS, fmt.Sprintf("%s message type received!", msg.Type))
 
 	if msg.ID != s.Agent {
-		cli.Message(cli.WARN, fmt.Sprintf("Input message was not for this agent (%s):\n%+v", s.Agent, msg))
+		cli.Message(cli.WARN, fmt.Sprintf("Input message was not for this agent (%s)", s.Agent))
 	}
 
 	switch msg.Type {
@@ -169,7 +180,9 @@ func (s *Service) Handle(msg messages.Base) (err error) {
 // Store adds a Base message to the out channel to be sent back to the Merlin server
 // Used when there is an error sending a message, and it needs to be preserved
 func (s *Service) Store(msg messages.Base) {
-	cli.Message(cli.DEBUG, fmt.Sprintf("services/messages.Store(): Entering into function with: %+v", msg))
+	if core.Debug {
+		cli.Message(cli.DEBUG, fmt.Sprintf("services/messages.Store(): Entering into function with: %+v", msg))
+	}
 	defer cli.Message(cli.DEBUG, "services/messages.Store(): Leaving function...")
 	out <- msg
 }

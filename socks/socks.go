@@ -34,6 +34,7 @@ import (
 
 	// Internal
 	"github.com/Ne0nd0g/merlin-agent/v2/cli"
+	"github.com/Ne0nd0g/merlin-agent/v2/core"
 	"github.com/Ne0nd0g/merlin-message/jobs"
 )
 
@@ -184,7 +185,9 @@ func listen(id uuid.UUID) {
 	buf := make([]byte, 500000)
 	for {
 		n, err := c.Out.Read(buf)
-		cli.Message(cli.DEBUG, fmt.Sprintf("Read %d bytes from the OUTBOUND pipe with error %v", n, err))
+		if core.Debug {
+			cli.Message(cli.DEBUG, fmt.Sprintf("Read %d bytes from the OUTBOUND pipe with error %v", n, err))
+		}
 
 		// Check if connection is being torn down
 		select {
@@ -268,7 +271,9 @@ func send(id uuid.UUID) {
 				cli.Message(cli.WARN, fmt.Sprintf("there was an error writing data to the SOCKS %s OUTBOUND pipe: %s", job.ID, err))
 				return
 			}
-			cli.Message(cli.DEBUG, fmt.Sprintf("Wrote %d bytes to the SOCKS %s OUTBOUND pipe", n, job.ID))
+			if core.Debug {
+				cli.Message(cli.DEBUG, fmt.Sprintf("Wrote %d bytes to the SOCKS %s OUTBOUND pipe", n, job.ID))
+			}
 		}
 
 		// If the SOCKS client has sent io.EOF to close the connection

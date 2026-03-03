@@ -48,18 +48,22 @@ func (c *Coder) Construct(data any, id []byte) ([]byte, error) {
 	data = append(id, data.([]byte)...)
 
 	// Base64 encode the data
-	payload := base64.StdEncoding.EncodeToString(data.([]byte))
-	return []byte(payload), nil
+	src := data.([]byte)
+	dst := make([]byte, base64.StdEncoding.EncodedLen(len(src)))
+	base64.StdEncoding.Encode(dst, src)
+	return dst, nil
 }
 
 // Deconstruct takes in data, base64 decodes it, and returns the decoded data as bytes
 // key is the UUID as bytes to prepend to the data
 func (c *Coder) Deconstruct(data, id []byte) (any, error) {
 	// Base64 decode the data
-	payload, err := base64.StdEncoding.DecodeString(string(data))
+	dst := make([]byte, base64.StdEncoding.DecodedLen(len(data)))
+	n, err := base64.StdEncoding.Decode(dst, data)
 	if err != nil {
 		return nil, err
 	}
+	payload := dst[:n]
 	// Validate the UUID
 	if string(payload[:36]) != string(id) {
 		return nil, fmt.Errorf("transformers/encoders/mythic/http.Deconstruct(): UUID mismatch have: %s want: %s", string(payload[:36]), string(id))

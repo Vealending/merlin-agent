@@ -78,25 +78,26 @@ func encrypt(plaintext []byte, key []byte) ([]byte, error) {
 		return nil, fmt.Errorf("transformers/encrypters/aes.encrypt(): %s", err)
 	}
 
-	ciphertext := make([]byte, aes.BlockSize+len(plaintext))
-	iv := ciphertext[:aes.BlockSize]
+	result := make([]byte, aes.BlockSize+len(plaintext)+32) // IV + Ciphertext + HMAC
+	iv := result[:aes.BlockSize]
 	if _, err := io.ReadFull(rand.Reader, iv); err != nil {
 		return nil, err
 	}
 
 	// AES CBC Encrypt
 	cbc := cipher.NewCBCEncrypter(block, iv)
-	cbc.CryptBlocks(ciphertext[aes.BlockSize:], plaintext)
+	cbc.CryptBlocks(result[aes.BlockSize:aes.BlockSize+len(plaintext)], plaintext)
 
-	// HMAC
+	// HMAC over IV + Ciphertext
 	hash := hmac.New(sha256.New, key)
-	_, err = hash.Write(ciphertext)
+	_, err = hash.Write(result[:aes.BlockSize+len(plaintext)])
 	if err != nil {
 		return nil, fmt.Errorf("there was an error in the aesEncrypt function writing the HMAC:\r\n%s", err)
 	}
 
-	// IV + Ciphertext + HMAC
-	return append(ciphertext, hash.Sum(nil)...), nil
+	// Append HMAC in-place
+	hash.Sum(result[aes.BlockSize+len(plaintext) : aes.BlockSize+len(plaintext)])
+	return result, nil
 }
 
 // decrypt reads in ciphertext data as a byte slice, decrypts it with the client's secret key, and returns the plaintext
@@ -133,7 +134,11 @@ func decrypt(ciphertext []byte, key []byte) ([]byte, error) {
 
 	// Verify the HMAC hash
 	h := hmac.New(sha256.New, key)
-	_, err = h.Write(append(iv, ciphertext...))
+	_, err = h.Write(iv)
+	if err != nil {
+		return nil, fmt.Errorf("there was an error in the aesDecrypt function writing the HMAC:\r\n%s", err)
+	}
+	_, err = h.Write(ciphertext)
 	if err != nil {
 		return nil, fmt.Errorf("there was an error in the aesDecrypt function writing the HMAC:\r\n%s", err)
 	}

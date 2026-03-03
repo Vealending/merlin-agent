@@ -43,6 +43,7 @@ import (
 	"github.com/Ne0nd0g/merlin-agent/v2/clients/tcp"
 	"github.com/Ne0nd0g/merlin-agent/v2/clients/udp"
 	"github.com/Ne0nd0g/merlin-agent/v2/core"
+	"github.com/Ne0nd0g/merlin-agent/v2/profiling"
 	"github.com/Ne0nd0g/merlin-agent/v2/run"
 )
 
@@ -122,6 +123,7 @@ var url = "https://127.0.0.1:443"
 var useragent = "Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/40.0.2214.85 Safari/537.36"
 
 func main() {
+	profiling.Start()
 	verbose := flag.Bool("v", false, "Enable verbose output")
 	version := flag.Bool("version", false, "Print the agent version and exit")
 	debug := flag.Bool("debug", false, "Enable debug output")

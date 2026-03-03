@@ -38,6 +38,7 @@ import (
 	// Internal
 	"github.com/Ne0nd0g/merlin-agent/v2/cli"
 	"github.com/Ne0nd0g/merlin-agent/v2/commands"
+	"github.com/Ne0nd0g/merlin-agent/v2/core"
 	"github.com/Ne0nd0g/merlin-agent/v2/services/agent"
 	"github.com/Ne0nd0g/merlin-agent/v2/services/client"
 	"github.com/Ne0nd0g/merlin-agent/v2/socks"
@@ -121,7 +122,9 @@ func (s *Service) Check() (returnJobs []jobs.Job) {
 		case job := <-out:
 			returnJobs = append(returnJobs, job)
 		default:
-			cli.Message(cli.DEBUG, fmt.Sprintf("services/job.Check(): Leaving function with %+v", returnJobs))
+			if core.Debug {
+				cli.Message(cli.DEBUG, fmt.Sprintf("services/job.Check(): Leaving function with %+v", returnJobs))
+			}
 			return returnJobs
 		}
 	}
@@ -131,7 +134,9 @@ func (s *Service) Check() (returnJobs []jobs.Job) {
 
 // Control handles jobs that have the CONTROL type used to configure the Agent or the network communication client
 func (s *Service) Control(job jobs.Job) {
-	cli.Message(cli.DEBUG, fmt.Sprintf("services/job.Control(): entering into function with %+v", job))
+	if core.Debug {
+		cli.Message(cli.DEBUG, fmt.Sprintf("services/job.Control(): entering into function with %+v", job))
+	}
 	cmd := job.Payload.(jobs.Command)
 	cli.Message(cli.NOTE, fmt.Sprintf("Received Agent Control Message: %s", cmd.Command))
 	var results jobs.Results
@@ -289,12 +294,16 @@ func (s *Service) Control(job jobs.Job) {
 	}
 	aInfo.Payload = s.AgentService.AgentInfo()
 	out <- aInfo
-	cli.Message(cli.DEBUG, fmt.Sprintf("services/job.Control(): leaving function with %+v", aInfo))
+	if core.Debug {
+		cli.Message(cli.DEBUG, fmt.Sprintf("services/job.Control(): leaving function with %+v", aInfo))
+	}
 }
 
 // Handle takes a list of jobs and places them into a job channel if they are a valid type, so they can be executed
 func (s *Service) Handle(Jobs []jobs.Job) {
-	cli.Message(cli.DEBUG, fmt.Sprintf("services/job.Handle(): entering into function with %+v", Jobs))
+	if core.Debug {
+		cli.Message(cli.DEBUG, fmt.Sprintf("services/job.Handle(): entering into function with %+v", Jobs))
+	}
 	for _, job := range Jobs {
 		// If the job belongs to this agent
 		if job.AgentID == s.Agent {
